@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vmcore"
+version = "0.1.0"
+description = "Input-agnostic video plumbing: probe, sampled frames, frame signals, HDR-aware proxies, FCP7/xmeml, and a content-addressed segment cache"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Geoff Schultz"}]
+# numpy is here because frames are handed out as arrays and every consumer
+# wants them that way. Everything else is the standard library plus ffmpeg,
+# which is an external binary rather than a wheel. tests/test_no_app_imports
+# enforces that this list stays this short.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["vmcore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
