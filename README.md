@@ -20,7 +20,7 @@ other, and it is enforced by a test rather than by good intentions:
 | `signals` | pure functions over frame arrays: brightness, contrast, saturation and hue, sharpness, motion, and a geometric composition centroid. numpy only, no OpenCV |
 | `proxy` | HDR-aware, colour-normalised 720p review proxies, tonemapping HLG to limited-range bt709 rather than letting it look wrong with exit code 0 |
 | `xmeml` | the FCP7/xmeml boilerplate Premiere actually accepts — rate and samplecharacteristics fragments, sequence skeleton, an atomic write with the exact header, one `<rate>/<ntsc>` parser for readers, and interval carving |
-| `segcache` | content-addressed cache for rendered segments, keyed on source, in-point, frame count, speed, HDR-ness and encode profile |
+| `segcache` | content-addressed cache for rendered segments: a store, plus `segment_key` keyed on source, in-point, frame rate, frame count, speed, HDR-ness, encode profile and crop centre. Read its module docstring before choosing it — an enumerated key is structurally behind the command it stands for, and hashing the ffmpeg argv is the alternative that cannot drift |
 | `store` | atomic record writes — temp file, fsync, `os.replace`, optional `.bak` — and the stage pattern: a directory of one JSON record per item plus a CSV index written only after a complete walk |
 | `thumbs` | evenly spaced JPEGs via ffmpeg, using the same filter chain the analysis pass uses, so a thumbnail shows what the analysis saw |
 | `media` | which file extensions count as video, audio and images |

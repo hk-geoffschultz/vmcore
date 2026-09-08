@@ -4,7 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vmcore"
-version = "0.1.0"
+# 0.2.0 rather than 0.1.1: `segcache.segment_key` gained a REQUIRED
+# `fps` argument. Its absence was a silent wrong-pixels hit, so the break
+# is the fix - a caller written against 0.1.0 gets a TypeError naming the
+# argument instead of a key that was quietly wrong. Consumers pin a
+# commit, so nothing moves until someone bumps a pin deliberately.
+version = "0.2.0"
 description = "Input-agnostic video plumbing: probe, sampled frames, frame signals, HDR-aware proxies, FCP7/xmeml, and a content-addressed segment cache"
 readme = "README.md"
 requires-python = ">=3.11"
