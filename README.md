@@ -16,7 +16,7 @@ other, and it is enforced by a test rather than by good intentions:
 | module | what it does |
 |---|---|
 | `probe` | ffprobe metadata, with one rotation parser that handles both display-matrix side data and the legacy `tags.rotate`, plus audio peak |
-| `frames` | decode a clip once, yield evenly sampled frames as BGR arrays, sized through the same rotation and byte-alignment rules as `probe`. `full_rate_vf` rides a filter fragment on that decode ahead of the `fps=` thinning (a scene-change detector, a `metadata=...:file=` sink), where it sees every native frame; the decode is then drained to EOF rather than cut off, so the file the filter writes is complete. vmcore splices it in verbatim and never reads what it wrote |
+| `frames` | decode a clip once, yield evenly sampled frames as BGR arrays, sized through the same rotation and byte-alignment rules as `probe`. `full_rate_vf` rides a filter fragment on that decode ahead of the `fps=` thinning (a scene-change detector, a `metadata=...:file=` sink), where it sees every native frame; the decode is then drained to EOF rather than cut off, so the file the filter writes is complete when ffmpeg finishes on its own. vmcore splices it in verbatim and never reads what it wrote; a fragment ffmpeg rejects raises `DecodeError` with its reason instead of yielding nothing |
 | `signals` | pure functions over frame arrays: brightness, contrast, saturation and hue, sharpness, motion, and a geometric composition centroid. numpy only, no OpenCV |
 | `proxy` | HDR-aware, colour-normalised 720p review proxies, tonemapping HLG to limited-range bt709 rather than letting it look wrong with exit code 0 |
 | `xmeml` | the FCP7/xmeml boilerplate Premiere actually accepts — rate and samplecharacteristics fragments, sequence skeleton, an atomic write with the exact header, one `<rate>/<ntsc>` parser for readers, and interval carving |
@@ -29,12 +29,15 @@ other, and it is enforced by a test rather than by good intentions:
 ## Install
 
 ```
-pip install "vmcore @ git+https://github.com/hk-geoffschultz/vmcore.git@v0.1.0"
+pip install "vmcore @ git+https://github.com/hk-geoffschultz/vmcore.git@19c59fa32f1ccc0f5b40ace7b43c3dc6d34f765b"
 ```
 
-Pin a tag or a commit SHA. A consumer that records which version it
-measured its thresholds against can reproduce that measurement later; one
-that tracks a branch cannot.
+Pin a commit SHA - the one shown is 0.2.0; use the one your consumer
+measured against. Not a tag: none exists on origin (the session git proxy
+that pushes this repo blocks tag pushes, so `v0.1.0` lives only in a local
+clone and an install that names it fails). A consumer that records which
+commit it measured its thresholds against can reproduce that measurement
+later; one that tracks a branch cannot.
 
 For local development against a consumer, an editable install points at a
 checkout so edits are live without a reinstall:

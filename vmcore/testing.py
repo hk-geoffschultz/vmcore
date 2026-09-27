@@ -22,15 +22,20 @@ import xml.etree.ElementTree as ET
 FPS = 24
 
 
-def make_mp4(path: Path, duration: float, w: int = 64, h: int = 36) -> None:
-    src = f"smptebars=size={w}x{h}:rate={FPS}:duration={duration:.3f}"
-    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", src, "-pix_fmt", "yuv420p"]
+def _encode(base: list[str], path: Path) -> None:
+    """libx264 when the build has it, mpeg4 when it does not - one place,
+    so the two clip builders cannot fall back differently."""
     proc = subprocess.run(base + ["-c:v", "libx264", "-preset", "ultrafast",
                                   str(path)], capture_output=True)
     if proc.returncode != 0:
         subprocess.run(base + ["-c:v", "mpeg4", str(path)], check=True,
                        capture_output=True)
+
+
+def make_mp4(path: Path, duration: float, w: int = 64, h: int = 36) -> None:
+    src = f"smptebars=size={w}x{h}:rate={FPS}:duration={duration:.3f}"
+    _encode(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", src, "-pix_fmt", "yuv420p"], path)
 
 
 def make_cut_mp4(path: Path, before: float = 1.0, after: float = 1.0,
@@ -45,15 +50,10 @@ def make_cut_mp4(path: Path, before: float = 1.0, after: float = 1.0,
     """
     black = f"color=c=black:s={w}x{h}:r={FPS}:d={before:.3f}"
     white = f"color=c=white:s={w}x{h}:r={FPS}:d={after:.3f}"
-    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", black, "-f", "lavfi", "-i", white,
-            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
-            "-map", "[v]", "-pix_fmt", "yuv420p"]
-    proc = subprocess.run(base + ["-c:v", "libx264", "-preset", "ultrafast",
-                                  str(path)], capture_output=True)
-    if proc.returncode != 0:
-        subprocess.run(base + ["-c:v", "mpeg4", str(path)], check=True,
-                       capture_output=True)
+    _encode(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", black, "-f", "lavfi", "-i", white,
+             "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+             "-map", "[v]", "-pix_fmt", "yuv420p"], path)
     return round(before * FPS)
 
 

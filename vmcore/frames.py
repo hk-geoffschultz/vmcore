@@ -25,16 +25,20 @@ One addition since (0.3.0): `full_rate_vf`, a filter fragment a caller
 can ride on this decode ahead of the `fps=` thinning, where it sees every
 native frame. It exists because the decode is the most expensive thing a
 consumer does with a clip, and a second one for a per-frame measurement
-doubles it, while a filter on the existing chain is close to free. vmcore
-splices the fragment in and lets ffmpeg finish so a file the filter writes
-is complete; it does not know what the fragment measures or read what it
-wrote. That stays with the caller, which is where knowing what a number
-means belongs.
+doubles it, while a filter on the existing chain costs nothing that
+separates from run-to-run noise. vmcore splices the fragment in and lets
+ffmpeg finish, so a file the filter writes is complete when the decode
+ends on its own; it does not know what the fragment measures or read what
+it wrote. That stays with the caller, which is where knowing what a number
+means belongs. What vmcore does hand back is ffmpeg's own complaint: a
+fragment it rejects raises `DecodeError` instead of yielding nothing.
 """
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -42,9 +46,39 @@ import numpy as np
 from .probe import display_dims, scaled_dims
 
 
+class DecodeError(RuntimeError):
+    """ffmpeg exited non-zero having yielded nothing, with a fragment set.
+
+    Raised by `sample_frames` on that path only. Without a fragment the
+    same outcome yields nothing, as it always has, because a corrupt file
+    in a dump of hundreds must not stop the walk; with one, nothing
+    yielded is ambiguous - the fragment is the caller's code, and a
+    filter ffmpeg rejects looks exactly like a file it cannot decode - so
+    what ffmpeg said is handed back instead of thrown away. `stderr` is
+    the tail of its output, `returncode` its exit, `cmd` the argv.
+
+    What this does NOT tell apart on its own: a rejected fragment from a
+    file that probes but does not decode. Both exit non-zero with nothing
+    yielded (measured 2026-09-27, ffmpeg 6.1.1: an unknown filter name
+    exits 8 "No such filter"; a sink path with an unescaped ':' exits 234
+    "Invalid argument"; a valid container whose payload is zeroed exits 69
+    "Decode error rate 1 exceeds maximum"). The message says which. A
+    walker that must not stop catches this per clip and records it.
+    """
+
+    def __init__(self, cmd: list[str], returncode: int | None, stderr: str):
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stderr = stderr
+        said = stderr.strip().splitlines()
+        super().__init__(
+            f"ffmpeg exited {returncode} having yielded no frames"
+            + (": " + " | ".join(said[-4:]) if said else ""))
+
+
 def analysis_vf(fps: float, long_edge: int,
                 full_rate_vf: str | None = None) -> str:
-    """The filter chain the raw pipe reads through.
+    r"""The filter chain the raw pipe reads through.
 
     Kept as its own function because `scaled_dims` has to predict this
     chain's output size exactly; when one changes the other must.
@@ -56,20 +90,36 @@ def analysis_vf(fps: float, long_edge: int,
     is byte-identical to what it was before the argument existed.
 
     The contract the fragment has to keep: it observes and passes through.
-    It must not change frame dimensions, drop or duplicate frames, or move
-    timestamps, because `scaled_dims` predicts the pipe's block size from
-    the `fps=`/`scale=` tail alone and `sample_frames` computes each
-    timestamp from the sample index; a fragment that scales would skew
-    every later frame with exit code 0, and one that drops frames would
-    put the wrong instant under every timestamp. ffmpeg may auto-insert a
-    pixel-format conversion ahead of a fragment that does not accept the
-    decoder's format; that leaves dimensions alone, so the byte contract
-    holds, but the analysis then sees the converted pixels.
+    It must not change the frame's aspect, drop or duplicate frames, move
+    timestamps, or write to stdout. `scaled_dims` predicts the pipe's
+    block size from the `fps=`/`scale=` tail alone and `sample_frames`
+    computes each timestamp from the sample index, so (measured
+    2026-09-27, ffmpeg 6.1.1, a 64x36 clip at long_edge 64): a fragment
+    that changes the aspect - `crop=32:36`, `pad=96:36` - misaligns the
+    pipe with exit code 0 (6 and 2 "frames" read where 4 were emitted);
+    one that scales without changing it (`scale=32:18`) keeps the block
+    size, because the tail scales it back, but the analysis then sees
+    resampled pixels; one that drops frames puts the wrong instant under
+    every timestamp; and a `metadata=...:file=-` sink writes its text
+    into the frame pipe (9 blocks read where 8 were emitted). ffmpeg may
+    auto-insert a pixel-format conversion ahead of a fragment that does
+    not accept the decoder's format; that leaves dimensions alone, so the
+    byte contract holds, but the analysis then sees the converted pixels.
 
-    The fragment goes in verbatim. Escaping it for ffmpeg's filtergraph
-    syntax is the caller's job - vmcore stays dumb about that syntax - so
-    a `file=` path containing ':' or ',' (or ';', '[', ']') must be quoted
-    or backslash-escaped by the caller before it gets here.
+    The fragment goes in verbatim, and vmcore stays dumb about ffmpeg's
+    syntax, so escaping a `file=` path is the caller's job - and it has
+    to survive TWO parsers, not one. The filtergraph parser ends a filter's
+    arguments at ',' ';' '[' ']' and strips one level of quotes or
+    backslashes; the option parser then splits what is left on ':' and
+    strips another. One level is therefore not enough: on this ffmpeg a
+    bare path, `'…'` quoted once, or `\:` escaped once are all rejected
+    with "Invalid argument" (and see `sample_frames` for what that raises).
+    Two forms are pinned by a test on a path with a space and a colon:
+    quote the value and backslash the colon inside the quotes,
+    `file='/a b\:c/sink.txt'`, or double-backslash it bare,
+    `file=/a\\ b\\:c/sink.txt`. The simplest thing is to choose a sink
+    path with none of those characters (a temporary file in a plain
+    directory) and escape nothing.
     """
     tail = (
         f"fps={fps:.6f},"
@@ -83,8 +133,15 @@ def analysis_vf(fps: float, long_edge: int,
 def thinned_fps(duration: float, fps: float, max_frames: int) -> float:
     """Drop the sample rate so a long clip still yields at most max_frames.
 
-    Protects against a 20-minute accidental recording costing 20 minutes of
-    decode. Returns `fps` unchanged when the clip is short enough.
+    What this bounds is the number of frames read off the pipe and handed
+    to numpy, not the decode: ffmpeg decodes every native frame either way
+    and `fps=` drops after decoding, so a 20-minute accidental recording is
+    still a 20-minute decode - it yields 60 frames instead of 2400. The
+    budget break in `sample_frames` does not shorten it either: with
+    thinning, the last sample falls in the clip's final interval and the
+    fps filter emits it only at EOF, so ffmpeg has finished by the time
+    Python stops reading (measured 2026-09-27, an 8s clip, every run).
+    Returns `fps` unchanged when the clip is short enough.
     """
     if duration <= 0 or fps <= 0:
         return fps
@@ -156,10 +213,31 @@ def sample_frames(
     already ends, so a filter writing a file (`metadata=mode=print:file=`)
     gets to close and flush it. A killed ffmpeg still runs its cleanup, so
     the file is not empty - it is cut short at wherever the decode was,
-    and reads as complete to anything that does not count (measured
-    2026-09-27: 54-87 of 192 frames, never 0). The cost is that a clip
-    past the budget is decoded to its end instead of being cut off,
-    bounded by `timeout`; that is the point of asking to see every frame.
+    and reads as complete to anything that does not count. How short is
+    load-dependent and moves run to run: on an 8s clip of 192 native
+    frames the old code's kill left roughly a quarter to a half of them
+    behind, never zero (2026-09-27, 64x36 and 320x180, 5 runs each,
+    three sets of runs on one box gave three different ranges). The cost
+    is that a clip past the budget is decoded to its end instead of being
+    cut off; that is the point of asking to see every frame.
+
+    `timeout` is not a bound on the decode, on any path. The read loop
+    has no deadline; `timeout` covers only `_shutdown`'s drain after the
+    consumer stops early, checked between reads of sixteen sampled frames,
+    and the wait for ffmpeg's exit after EOF. An ffmpeg that stalls
+    mid-stream is not what it guards against (measured 2026-09-27: a 4s
+    clip through a `realtime` fragment with `timeout=1` took 4.1s whether
+    the consumer took everything, two frames, or one and closed).
+
+    With the fragment set, ffmpeg exiting non-zero having yielded nothing
+    raises `DecodeError` with what it said, rather than yielding nothing:
+    a rejected fragment is the caller's code and is otherwise
+    indistinguishable from a file that does not decode - and the raise
+    covers both, see the exception. A file `probe` cannot read still
+    yields nothing, on either path, before ffmpeg is run at all. Without a
+    fragment, stderr is discarded and nothing yielded is nothing yielded,
+    as before.
+
     vmcore does not read the sink or know its path: a caller that needs to
     know the file is complete counts its frames against the source.
     """
@@ -184,24 +262,35 @@ def sample_frames(
     w, h = scaled_dims(src[0], src[1], long_edge)
     frame_bytes = w * h * 3
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        bufsize=frame_bytes * 2,
-    )
-    idx = 0
-    try:
-        while True:
-            buf = proc.stdout.read(frame_bytes)
-            if not buf or len(buf) < frame_bytes:
-                break
-            if idx < max_frames:
-                yield (idx / fps,
-                       np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3))
-            idx += 1
-            if idx >= max_frames and not drain:
-                break
-    finally:
-        _shutdown(proc, frame_bytes, timeout, drain=drain, proxy_out=proxy_out)
+    # stderr goes to a file, not a pipe, on the fragment path: a pipe that
+    # nobody reads while the frame loop blocks on stdout would fill and
+    # stall ffmpeg on a file with many decode errors. Without a fragment it
+    # is discarded, as it always was.
+    with (tempfile.TemporaryFile() if full_rate_vf else nullcontext()) as err:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL if err is None else err,
+            bufsize=frame_bytes * 2,
+        )
+        idx = 0
+        try:
+            while True:
+                buf = proc.stdout.read(frame_bytes)
+                if not buf or len(buf) < frame_bytes:
+                    break
+                if idx < max_frames:
+                    yield (idx / fps,
+                           np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3))
+                idx += 1
+                if idx >= max_frames and not drain:
+                    break
+        finally:
+            _shutdown(proc, frame_bytes, timeout, drain=drain,
+                      proxy_out=proxy_out)
+        if err is not None and idx == 0 and proc.returncode != 0:
+            err.seek(0)
+            raise DecodeError(cmd, proc.returncode,
+                              err.read()[-4096:].decode("utf-8", "replace"))
 
 
 def _shutdown(proc, frame_bytes: int, timeout: int, *, drain: bool,
@@ -212,7 +301,14 @@ def _shutdown(proc, frame_bytes: int, timeout: int, *, drain: bool,
     Draining: the same process is still writing something - the proxy, or
     a full-rate filter's sink - and breaking the pipe here truncates it.
     Read the rawvideo tail - fps-thinned, so a handful of frames at most -
-    to EOF and let ffmpeg finish, within `timeout`.
+    to EOF and let ffmpeg finish. `timeout` is checked between those reads
+    and bounds the wait after EOF; a read that never returns is not
+    bounded by it (see `sample_frames`).
+
+    Every kill is followed by a wait, so `returncode` is a number by the
+    time anyone reads it: before, a killed process was left for Popen's
+    finalizer to reap and `returncode` stayed None - which the proxy
+    unlink below treated as "not 0", correct by accident.
     """
     if not drain:
         try:
@@ -224,6 +320,7 @@ def _shutdown(proc, frame_bytes: int, timeout: int, *, drain: bool,
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
         return
 
     try:
@@ -235,6 +332,7 @@ def _shutdown(proc, frame_bytes: int, timeout: int, *, drain: bool,
         proc.wait(timeout=max(1, deadline - time.monotonic()))
     except Exception:
         proc.kill()
+        proc.wait()
     # A non-zero exit means the proxy is partial; a partial proxy that looks
     # complete is worse than none, because nothing downstream re-renders it.
     # A full-rate filter's sink is the caller's file, so nothing is done to

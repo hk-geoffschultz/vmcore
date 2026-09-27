@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 
 from vmcore.testing import FPS, make_cut_mp4, make_mp4
-from vmcore.frames import analysis_vf, decode_cmd, sample_frames, thinned_fps
+from vmcore.frames import (DecodeError, analysis_vf, decode_cmd, sample_frames,
+                           thinned_fps)
 from vmcore.probe import display_dims, scaled_dims
 
 LONG_EDGE = 64  # keep the decode tiny; the arithmetic is what's under test
@@ -103,14 +104,24 @@ def test_unprobeable_file_yields_nothing_rather_than_raising(tmp_path):
 #
 # `full_rate_vf` splices a fragment in ahead of the fps thinning, where it
 # sees every native frame, and keeps ffmpeg alive to EOF so a file the
-# fragment writes is complete. The tests pin three things: the chain and
-# the argv are what they were when the fragment is absent, the frames are
-# what they were when it is present, and the sink is whole - including the
-# case the old code would have killed, a clip past the frame budget. The
-# scdet + metadata pair is the fragment these were written against, and
-# the last test pins the exact text that filter pair writes, because a
-# consumer parses it.
+# fragment writes is complete. The tests pin four things: the chain and
+# the argv are what they were when the fragment is absent; the frames are
+# what they were when it is present; the sink is whole in the two cases
+# where the old code demonstrably killed the decode (a `duration` that
+# understates the file, and a consumer that stops early - the thinned
+# budget case is pinned too, but the old code left that sink whole as
+# well, see its docstring); and what ffmpeg rejects is raised with its
+# reason rather than yielded as nothing. The scdet + metadata pair is the
+# fragment these were written against, and the scdet test pins the exact
+# text that filter pair writes, because a consumer parses it.
 # --------------------------------------------------------------------------
+
+# scdet's own default threshold (`ffmpeg -h filter=scdet`: t, default 10).
+# A declared choice, not a measurement, and not load-bearing here: on the
+# black-then-white clip the cut scores 85.5 and every other frame 0, so
+# any t in (0, 85.5) gives the same result. What a score means on real
+# footage is the consumer's measurement to make.
+SCDET_T = 10.0
 
 def _native_frames(path: Path) -> int:
     """How many frames the file really holds, by decoding it (ffprobe).
@@ -147,7 +158,7 @@ def _blocks(sink: Path) -> list[dict]:
     return blocks
 
 
-def _scdet(sink: Path, t: float = 10.0) -> str:
+def _scdet(sink: Path | str, t: float = SCDET_T) -> str:
     return f"scdet=t={t},metadata=mode=print:file={sink}"
 
 
@@ -270,7 +281,10 @@ def test_sink_is_complete_when_the_consumer_stops_early(tmp_path):
     """Taking one frame and closing the generator is the path through
     `_shutdown` proper; with the fragment set it drains to EOF instead of
     killing the decode, so the sink is still whole. Measured 2026-09-27 on
-    this clip: the old code left 54-65 of 192 frames in the sink."""
+    this clip: the old code's kill left roughly a quarter to a third of
+    the 192 frames in the sink, a different range in every set of five
+    runs and never zero, because how far ffmpeg got before SIGTERM is a
+    matter of load. The mechanism is the finding; a range is a snapshot."""
     clip = tmp_path / "eight.mp4"
     make_mp4(clip, duration=8.0)
     native = _native_frames(clip)
@@ -299,7 +313,7 @@ def test_scdet_scores_exactly_the_cut_frame_and_tags_every_frame(tmp_path):
 
     sink = tmp_path / "scd.txt"
     got = list(sample_frames(clip, 2.0, fps=2.0, long_edge=LONG_EDGE,
-                             full_rate_vf=_scdet(sink, t=10.0)))
+                             full_rate_vf=_scdet(sink, t=SCDET_T)))
     assert len(got) == 4
 
     blocks = _blocks(sink)
@@ -309,7 +323,8 @@ def test_scdet_scores_exactly_the_cut_frame_and_tags_every_frame(tmp_path):
         assert "lavfi.scd.score" in b, b
         float(b["lavfi.scd.mafd"]), float(b["lavfi.scd.score"])
 
-    fired = [b["frame"] for b in blocks if float(b["lavfi.scd.score"]) >= 10.0]
+    fired = [b["frame"] for b in blocks
+             if float(b["lavfi.scd.score"]) >= SCDET_T]
     assert fired == [cut]
     tagged = [b["frame"] for b in blocks if "lavfi.scd.time" in b]
     assert tagged == [cut]
@@ -317,6 +332,95 @@ def test_scdet_scores_exactly_the_cut_frame_and_tags_every_frame(tmp_path):
     # scdet's score is min(mafd, |mafd - previous mafd|); on the frame
     # before the cut mafd is 0, so the score on the cut is its own mafd.
     assert blocks[cut]["lavfi.scd.score"] == blocks[cut]["lavfi.scd.mafd"]
+
+
+def test_a_rejected_fragment_raises_with_what_ffmpeg_said(tmp_path):
+    """The fragment is the caller's code. A filter ffmpeg does not have
+    used to look, from the caller's side, exactly like a zero-length
+    recording - nothing yielded, no exception - with ffmpeg's reason (exit
+    8, "No such filter") sent to DEVNULL. Now it raises, and the message
+    names the filter."""
+    clip = tmp_path / "two.mp4"
+    make_mp4(clip, duration=2.0)
+    with pytest.raises(DecodeError) as e:
+        list(sample_frames(clip, 2.0, fps=2.0, long_edge=LONG_EDGE,
+                           full_rate_vf="nosuchfilter"))
+    assert "nosuchfilter" in str(e.value)
+    assert e.value.returncode not in (0, None)
+    assert e.value.cmd[0] == "ffmpeg"
+
+
+def test_an_unprobeable_file_still_yields_nothing_with_a_fragment_set(
+        tmp_path):
+    """The walk rule survives on the fragment path: a file `probe` cannot
+    read is returned on before ffmpeg is run, fragment or not."""
+    junk = tmp_path / "not-really.mp4"
+    junk.write_bytes(b"not a video")
+    sink = tmp_path / "scd.txt"
+    assert list(sample_frames(junk, 5.0, long_edge=LONG_EDGE,
+                              full_rate_vf=_scdet(sink))) == []
+    assert not sink.exists()
+
+
+def test_a_file_that_probes_but_does_not_decode_raises_only_with_a_fragment(
+        tmp_path):
+    """The boundary the raise draws, pinned honestly: a valid container
+    whose payload is zeroed probes fine and exits non-zero with nothing
+    yielded, exactly like a rejected fragment. Without a fragment that is
+    still nothing yielded, as it always was; with one it is `DecodeError`
+    carrying ffmpeg's words, and the caller that must keep walking catches
+    it per clip. The message is not pinned - it is ffmpeg's, and this test
+    is about which path raises, not what it says."""
+    clip = tmp_path / "two.mp4"
+    make_mp4(clip, duration=2.0)
+    data = bytearray(clip.read_bytes())
+    i = data.find(b"mdat")
+    size = int.from_bytes(data[i - 4:i], "big")
+    data[i + 4:i - 4 + size] = b"\0" * (size - 8)
+    corrupt = tmp_path / "zeroed.mp4"
+    corrupt.write_bytes(data)
+    assert display_dims(corrupt) is not None, "the file has to probe"
+
+    assert list(sample_frames(corrupt, 2.0, fps=2.0, long_edge=LONG_EDGE)) == []
+    sink = tmp_path / "scd.txt"
+    with pytest.raises(DecodeError) as e:
+        list(sample_frames(corrupt, 2.0, fps=2.0, long_edge=LONG_EDGE,
+                           full_rate_vf=_scdet(sink)))
+    assert e.value.stderr.strip()
+
+
+def test_sink_path_with_a_colon_and_a_space_is_escaped_for_two_parsers(
+        tmp_path):
+    """The escaping the caller owes, measured rather than assumed: the
+    filtergraph parser strips one level, the option parser another, so a
+    ':' in a `file=` path needs `\\:` inside single quotes or `\\\\:` bare.
+    The one-level forms - bare, quoted once, backslashed once - are what a
+    caller following the obvious rule writes, and ffmpeg rejects them; that
+    is now a raise rather than a silent zero."""
+    clip = tmp_path / "two.mp4"
+    make_mp4(clip, duration=2.0)
+    native = _native_frames(clip)
+    d = tmp_path / "esc dir:x"
+    d.mkdir()
+    sink = d / "sink.txt"
+    raw = str(sink)
+
+    def run(form: str) -> list:
+        sink.unlink(missing_ok=True)
+        return list(sample_frames(clip, 2.0, fps=2.0, long_edge=LONG_EDGE,
+                                  full_rate_vf=_scdet(form)))
+
+    quoted = "'" + raw.replace(":", "\\:") + "'"
+    assert len(run(quoted)) == 4
+    _assert_whole(sink, native)
+    bare = raw.replace(":", "\\\\:").replace(" ", "\\\\ ")
+    assert len(run(bare)) == 4
+    _assert_whole(sink, native)
+
+    for wrong in (raw, f"'{raw}'", raw.replace(":", "\\:").replace(" ", "\\ ")):
+        with pytest.raises(DecodeError):
+            run(wrong)
+        assert not sink.exists()
 
 
 def _can_encode_proxy() -> bool:
