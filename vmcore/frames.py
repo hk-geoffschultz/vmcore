@@ -28,9 +28,11 @@ consumer does with a clip, and a second one for a per-frame measurement
 doubles it, while a filter on the existing chain costs nothing that
 separates from run-to-run noise. vmcore splices the fragment in and lets
 ffmpeg finish, so a file the filter writes is complete when the decode
-ends on its own; it does not know what the fragment measures or read what
-it wrote. That stays with the caller, which is where knowing what a number
-means belongs. What vmcore does hand back is ffmpeg's own complaint: a
+ends on its own; it does not know what the fragment measures. What a
+number means stays with the caller. What vmcore does own is the FORMAT
+of what the `metadata` filter prints - `metadata_print_blocks` reads it
+into one dict per frame, the same way the pipe's block size is a fact
+about ffmpeg and not about any footage - and ffmpeg's own complaint: a
 fragment it rejects raises `DecodeError` instead of yielding nothing.
 """
 from __future__ import annotations
@@ -128,6 +130,38 @@ def analysis_vf(fps: float, long_edge: int,
     if full_rate_vf:
         return f"{full_rate_vf},{tail}"
     return tail
+
+
+def metadata_print_blocks(text: str) -> list[dict]:
+    """What ffmpeg's `metadata=mode=print` filter wrote, one dict per frame.
+
+    The format (ffmpeg 6.1.1, pinned by a test on a real cut): a header
+    line `frame:N pts:P pts_time:T` per frame, then `key=value` lines
+    until the next header. Each dict carries `frame` (int) and `pts_time`
+    (float) from the header and every `key=value` as a STRING - the
+    filter prints `0` for the first frame's `pts_time`, `1` for a
+    `lavfi.scd.time` of one second and `85.547` for a score, so a caller
+    that wants numbers parses floats and never matches a decimal shape.
+    Lines before the first header are ignored; the frame numbers are
+    ffmpeg's own and run from 0 in order, so a caller counting whether a
+    sink is whole compares `len` against the file's native frame count.
+
+    This is a reader of a format, not of a measurement: it carries no
+    opinion about what any key means. It lives here rather than in every
+    consumer because a filter's print format is a fact about ffmpeg, like
+    the pipe's block size, and two copies of a parser of the same text
+    would drift the way two copies of `_scaled_dims` once did.
+    """
+    blocks: list[dict] = []
+    for line in text.splitlines():
+        if line.startswith("frame:"):
+            fields = dict(tok.split(":", 1) for tok in line.split())
+            blocks.append({"frame": int(fields["frame"]),
+                           "pts_time": float(fields["pts_time"])})
+        elif "=" in line and blocks:
+            k, v = line.split("=", 1)
+            blocks[-1][k] = v
+    return blocks
 
 
 def thinned_fps(duration: float, fps: float, max_frames: int) -> float:

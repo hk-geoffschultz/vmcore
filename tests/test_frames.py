@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 
 from vmcore.testing import FPS, make_cut_mp4, make_mp4
-from vmcore.frames import (DecodeError, analysis_vf, decode_cmd, sample_frames,
-                           thinned_fps)
+from vmcore.frames import (DecodeError, analysis_vf, decode_cmd,
+                           metadata_print_blocks, sample_frames, thinned_fps)
 from vmcore.probe import display_dims, scaled_dims
 
 LONG_EDGE = 64  # keep the decode tiny; the arithmetic is what's under test
@@ -139,23 +139,34 @@ def _native_frames(path: Path) -> int:
 
 
 def _blocks(sink: Path) -> list[dict]:
-    """The metadata filter's print format, one dict per frame.
+    """The metadata filter's print format, one dict per frame, through
+    the one reader vmcore ships for it - the pipeline's signals stage
+    reads the same text through the same function, so a drift between
+    the two is not possible rather than merely untested."""
+    return metadata_print_blocks(sink.read_text())
 
-    A frame is a `frame:N pts:P pts_time:T` header followed by `key=value`
-    lines until the next header. Kept literal here, not shared from vmcore:
-    vmcore does not parse what a fragment writes, and this is a test of
-    the text a consumer will have to.
-    """
-    blocks: list[dict] = []
-    for line in sink.read_text().splitlines():
-        if line.startswith("frame:"):
-            fields = dict(tok.split(":", 1) for tok in line.split())
-            blocks.append({"frame": int(fields["frame"]),
-                           "pts_time": float(fields["pts_time"])})
-        elif "=" in line and blocks:
-            k, v = line.split("=", 1)
-            blocks[-1][k] = v
-    return blocks
+
+def test_metadata_print_blocks_reads_the_format_and_keeps_values_as_strings():
+    """The format facts a consumer relies on, pinned on literal text: a
+    header per frame, the first frame's `pts_time:0` and a whole-second
+    `lavfi.scd.time=1` printed with no decimal, `key=value` lines kept as
+    strings, and text before the first header ignored."""
+    text = ("noise before the first header\n"
+            "frame:0    pts:0       pts_time:0\n"
+            "lavfi.scd.mafd=0.000\n"
+            "lavfi.scd.score=0.000\n"
+            "frame:24   pts:600     pts_time:1\n"
+            "lavfi.scd.mafd=85.547\n"
+            "lavfi.scd.score=85.547\n"
+            "lavfi.scd.time=1\n")
+    blocks = metadata_print_blocks(text)
+    assert [b["frame"] for b in blocks] == [0, 24]
+    assert [b["pts_time"] for b in blocks] == [0.0, 1.0]
+    assert blocks[0]["lavfi.scd.mafd"] == "0.000"
+    assert blocks[1]["lavfi.scd.score"] == "85.547"
+    assert blocks[1]["lavfi.scd.time"] == "1"
+    assert "lavfi.scd.time" not in blocks[0]
+    assert metadata_print_blocks("") == []
 
 
 def _scdet(sink: Path | str, t: float = SCDET_T) -> str:
