@@ -4,12 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vmcore"
-# 0.2.0 rather than 0.1.1: `segcache.segment_key` gained a REQUIRED
-# `fps` argument. Its absence was a silent wrong-pixels hit, so the break
-# is the fix - a caller written against 0.1.0 gets a TypeError naming the
-# argument instead of a key that was quietly wrong. Consumers pin a
-# commit, so nothing moves until someone bumps a pin deliberately.
-version = "0.2.0"
+# 0.3.0 rather than 0.2.1: `frames.sample_frames` gained a capability, a
+# keyword-only `full_rate_vf` that rides a filter on the decode ahead of
+# the fps thinning, not a fix. Nothing existing moves - the default chain
+# is byte-identical and a test pins it - so it is a minor bump, not a
+# major one. (0.2.0 was the reverse: `segcache.segment_key` gained a
+# REQUIRED `fps` argument, because its absence was a silent wrong-pixels
+# hit and a TypeError naming the argument was the only acceptable way to
+# learn that a key was wrong.) Consumers pin a commit, so nothing moves
+# until someone bumps a pin deliberately.
+version = "0.3.0"
 description = "Input-agnostic video plumbing: probe, sampled frames, frame signals, HDR-aware proxies, FCP7/xmeml, and a content-addressed segment cache"
 readme = "README.md"
 requires-python = ">=3.11"

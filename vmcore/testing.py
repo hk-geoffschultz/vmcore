@@ -33,6 +33,30 @@ def make_mp4(path: Path, duration: float, w: int = 64, h: int = 36) -> None:
                        capture_output=True)
 
 
+def make_cut_mp4(path: Path, before: float = 1.0, after: float = 1.0,
+                 w: int = 64, h: int = 36) -> int:
+    """Black for `before` seconds, then white for `after`: one hard cut.
+
+    Returns the index of the first white frame, counted at the native rate
+    FPS from zero, so a test can say exactly where a scene-change detector
+    must fire and nowhere else. Built from two lavfi colour sources joined
+    with `concat`, so every frame on either side is identical to its
+    neighbours and the only frame difference in the file is the cut.
+    """
+    black = f"color=c=black:s={w}x{h}:r={FPS}:d={before:.3f}"
+    white = f"color=c=white:s={w}x{h}:r={FPS}:d={after:.3f}"
+    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", black, "-f", "lavfi", "-i", white,
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]", "-pix_fmt", "yuv420p"]
+    proc = subprocess.run(base + ["-c:v", "libx264", "-preset", "ultrafast",
+                                  str(path)], capture_output=True)
+    if proc.returncode != 0:
+        subprocess.run(base + ["-c:v", "mpeg4", str(path)], check=True,
+                       capture_output=True)
+    return round(before * FPS)
+
+
 def make_wav(path: Path, duration: float) -> None:
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                     "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono",

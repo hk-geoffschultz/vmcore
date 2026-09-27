@@ -16,7 +16,7 @@ other, and it is enforced by a test rather than by good intentions:
 | module | what it does |
 |---|---|
 | `probe` | ffprobe metadata, with one rotation parser that handles both display-matrix side data and the legacy `tags.rotate`, plus audio peak |
-| `frames` | decode a clip once, yield evenly sampled frames as BGR arrays, sized through the same rotation and byte-alignment rules as `probe` |
+| `frames` | decode a clip once, yield evenly sampled frames as BGR arrays, sized through the same rotation and byte-alignment rules as `probe`. `full_rate_vf` rides a filter fragment on that decode ahead of the `fps=` thinning (a scene-change detector, a `metadata=...:file=` sink), where it sees every native frame; the decode is then drained to EOF rather than cut off, so the file the filter writes is complete. vmcore splices it in verbatim and never reads what it wrote |
 | `signals` | pure functions over frame arrays: brightness, contrast, saturation and hue, sharpness, motion, and a geometric composition centroid. numpy only, no OpenCV |
 | `proxy` | HDR-aware, colour-normalised 720p review proxies, tonemapping HLG to limited-range bt709 rather than letting it look wrong with exit code 0 |
 | `xmeml` | the FCP7/xmeml boilerplate Premiere actually accepts — rate and samplecharacteristics fragments, sequence skeleton, an atomic write with the exact header, one `<rate>/<ntsc>` parser for readers, and interval carving |

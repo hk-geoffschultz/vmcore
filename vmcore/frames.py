@@ -20,6 +20,16 @@ Two deliberate changes from the original:
    had to match ffmpeg's `av_rescale` or the pipe is read misaligned. Using
    probe's versions means one implementation of that contract, already
    covered by 18 tests, instead of a second copy drifting behind it.
+
+One addition since (0.3.0): `full_rate_vf`, a filter fragment a caller
+can ride on this decode ahead of the `fps=` thinning, where it sees every
+native frame. It exists because the decode is the most expensive thing a
+consumer does with a clip, and a second one for a per-frame measurement
+doubles it, while a filter on the existing chain is close to free. vmcore
+splices the fragment in and lets ffmpeg finish so a file the filter writes
+is complete; it does not know what the fragment measures or read what it
+wrote. That stays with the caller, which is where knowing what a number
+means belongs.
 """
 from __future__ import annotations
 
@@ -32,16 +42,42 @@ import numpy as np
 from .probe import display_dims, scaled_dims
 
 
-def analysis_vf(fps: float, long_edge: int) -> str:
+def analysis_vf(fps: float, long_edge: int,
+                full_rate_vf: str | None = None) -> str:
     """The filter chain the raw pipe reads through.
 
     Kept as its own function because `scaled_dims` has to predict this
     chain's output size exactly; when one changes the other must.
+
+    `full_rate_vf` is a filter fragment spliced in BEFORE the `fps=`
+    thinning, so it sees every native frame rather than the sampled ones -
+    a scene-change detector (`scdet`) or a `metadata=mode=print:file=PATH`
+    sink is the intended kind of thing. With it unset (or empty) the chain
+    is byte-identical to what it was before the argument existed.
+
+    The contract the fragment has to keep: it observes and passes through.
+    It must not change frame dimensions, drop or duplicate frames, or move
+    timestamps, because `scaled_dims` predicts the pipe's block size from
+    the `fps=`/`scale=` tail alone and `sample_frames` computes each
+    timestamp from the sample index; a fragment that scales would skew
+    every later frame with exit code 0, and one that drops frames would
+    put the wrong instant under every timestamp. ffmpeg may auto-insert a
+    pixel-format conversion ahead of a fragment that does not accept the
+    decoder's format; that leaves dimensions alone, so the byte contract
+    holds, but the analysis then sees the converted pixels.
+
+    The fragment goes in verbatim. Escaping it for ffmpeg's filtergraph
+    syntax is the caller's job - vmcore stays dumb about that syntax - so
+    a `file=` path containing ':' or ',' (or ';', '[', ']') must be quoted
+    or backslash-escaped by the caller before it gets here.
     """
-    return (
+    tail = (
         f"fps={fps:.6f},"
         f"scale='if(gt(iw,ih),{long_edge},-2)':'if(gt(iw,ih),-2,{long_edge})'"
     )
+    if full_rate_vf:
+        return f"{full_rate_vf},{tail}"
+    return tail
 
 
 def thinned_fps(duration: float, fps: float, max_frames: int) -> float:
@@ -55,6 +91,38 @@ def thinned_fps(duration: float, fps: float, max_frames: int) -> float:
     return fps if duration * fps <= max_frames else max_frames / duration
 
 
+def decode_cmd(path: Path, vf: str, proxy_out: Path | None = None) -> list[str]:
+    """The exact argv `sample_frames` runs, given its finished analysis chain.
+
+    Its own function so a test can pin the command's shape - which binary,
+    where the chain sits, that the proxy branch is untouched by whatever
+    was spliced into the analysis one - without decoding anything. (The
+    fused form still probes the source's colour transfer, because the proxy
+    branch's chain depends on it; that is ffprobe, not a decode.)
+    """
+    if proxy_out is None:
+        return [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(path),
+            "-vf", vf,
+            "-map", "0:v:0",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-",
+        ]
+
+    from . import proxy as _proxy
+
+    pvf = _proxy.proxy_vf(_proxy.color_transfer(path))
+    return [
+        _proxy.full_ffmpeg(), "-hide_banner", "-loglevel", "error",
+        "-i", str(path),
+        "-filter_complex",
+        f"[0:v:0]split=2[an][px];[an]{vf}[aout];[px]{pvf}[pout]",
+        "-map", "[aout]", "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+        "-map", "[pout]",
+    ] + _proxy.proxy_encode_args(proxy_out)
+
+
 def sample_frames(
     path: Path,
     duration: float,
@@ -64,6 +132,7 @@ def sample_frames(
     long_edge: int = 960,
     timeout: int = 900,
     proxy_out: Path | None = None,
+    full_rate_vf: str | None = None,
 ):
     """Yield `(timestamp_seconds, BGR ndarray)` sampled across the clip.
 
@@ -76,35 +145,36 @@ def sample_frames(
     the proxy costs an encode, not a second read of 20GB. The fused form
     needs the full ffmpeg build (tonemap for HLG sources); analysis-only
     keeps using the system binary, whose decode behaviour is load-bearing.
+
+    With `full_rate_vf`, a filter fragment rides the same decode ahead of
+    the `fps=` thinning, on the analysis branch, where it sees every native
+    frame (see `analysis_vf` for what the fragment may and may not do, and
+    for the escaping the caller owes). The frames yielded are unchanged by
+    it. What changes is how the decode ends: with the fragment set the
+    process is never terminated at the frame budget - the pipe is drained
+    to EOF and ffmpeg exits on its own, the way the fused proxy form
+    already ends, so a filter writing a file (`metadata=mode=print:file=`)
+    gets to close and flush it. A killed ffmpeg still runs its cleanup, so
+    the file is not empty - it is cut short at wherever the decode was,
+    and reads as complete to anything that does not count (measured
+    2026-09-27: 54-87 of 192 frames, never 0). The cost is that a clip
+    past the budget is decoded to its end instead of being cut off,
+    bounded by `timeout`; that is the point of asking to see every frame.
+    vmcore does not read the sink or know its path: a caller that needs to
+    know the file is complete counts its frames against the source.
     """
     if duration <= 0:
         return
 
     fps = thinned_fps(duration, fps, max_frames)
-    vf = analysis_vf(fps, long_edge)
+    vf = analysis_vf(fps, long_edge, full_rate_vf)
+    # Either way the process has to be allowed to finish on its own: the
+    # proxy is still being written, or a full-rate filter's sink is.
+    drain = proxy_out is not None or bool(full_rate_vf)
 
-    if proxy_out is None:
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(path),
-            "-vf", vf,
-            "-map", "0:v:0",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-",
-        ]
-    else:
-        from . import proxy as _proxy
-
+    if proxy_out is not None:
         proxy_out.parent.mkdir(parents=True, exist_ok=True)
-        pvf = _proxy.proxy_vf(_proxy.color_transfer(path))
-        cmd = [
-            _proxy.full_ffmpeg(), "-hide_banner", "-loglevel", "error",
-            "-i", str(path),
-            "-filter_complex",
-            f"[0:v:0]split=2[an][px];[an]{vf}[aout];[px]{pvf}[pout]",
-            "-map", "[aout]", "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
-            "-map", "[pout]",
-        ] + _proxy.proxy_encode_args(proxy_out)
+    cmd = decode_cmd(path, vf, proxy_out)
 
     # Every frame is a fixed-size block, so the byte count has to match what
     # ffmpeg emits exactly — one byte out and every later frame is skewed.
@@ -128,21 +198,23 @@ def sample_frames(
                 yield (idx / fps,
                        np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3))
             idx += 1
-            if idx >= max_frames and proxy_out is None:
+            if idx >= max_frames and not drain:
                 break
     finally:
-        _shutdown(proc, frame_bytes, timeout, proxy_out)
+        _shutdown(proc, frame_bytes, timeout, drain=drain, proxy_out=proxy_out)
 
 
-def _shutdown(proc, frame_bytes: int, timeout: int, proxy_out: Path | None):
-    """Stop the decode without truncating a proxy that's still being written.
+def _shutdown(proc, frame_bytes: int, timeout: int, *, drain: bool,
+              proxy_out: Path | None):
+    """Stop the decode without truncating a file that's still being written.
 
-    Analysis-only: enough frames means we're done, so kill the decode.
-    Fused: the same process is still writing the proxy, and breaking the
-    pipe here truncates it. Drain the rawvideo tail — fps-thinned, so a
-    handful of frames at most — and let ffmpeg finish.
+    Not draining: enough frames means we're done, so kill the decode.
+    Draining: the same process is still writing something - the proxy, or
+    a full-rate filter's sink - and breaking the pipe here truncates it.
+    Read the rawvideo tail - fps-thinned, so a handful of frames at most -
+    to EOF and let ffmpeg finish, within `timeout`.
     """
-    if proxy_out is None:
+    if not drain:
         try:
             proc.stdout.close()
         except Exception:
@@ -165,5 +237,7 @@ def _shutdown(proc, frame_bytes: int, timeout: int, proxy_out: Path | None):
         proc.kill()
     # A non-zero exit means the proxy is partial; a partial proxy that looks
     # complete is worse than none, because nothing downstream re-renders it.
-    if proc.returncode != 0 and proxy_out.exists():
+    # A full-rate filter's sink is the caller's file, so nothing is done to
+    # it here; the caller checks it against the source.
+    if proxy_out is not None and proc.returncode != 0 and proxy_out.exists():
         proxy_out.unlink()
