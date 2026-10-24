@@ -12,3 +12,11 @@ enforces it — no module here may import anything outside the standard
 library and numpy — because the rule is invisible to every other test.
 Everything keeps working right up until the package stops being liftable.
 """
+# The release this source tree is. pyproject.toml's `version` must say the
+# same thing: tests/test_version.py fails when they differ. It is a literal
+# here, and not read back from the installed metadata, so that it describes
+# the code actually imported. A copy on PYTHONPATH, a vendored copy and an
+# editable install made before a version bump all report their own version,
+# where `importlib.metadata.version("vmcore")` would report whichever
+# distribution pip happens to have recorded.
+__version__ = "0.4.0"

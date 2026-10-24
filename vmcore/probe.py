@@ -34,7 +34,12 @@ class ClipInfo:
     fps: float
     rotation: int             # degrees, from display matrix
     created: str              # best-effort creation timestamp, ISO or ""
-    audio_peak_db: float      # max audio level, -inf floor clamped to -99
+    # Max audio level in dBFS, from ffmpeg's volumedetect. Digital silence
+    # reads -91.0 (measured, ffmpeg 6.1.1): a real measurement, not a clamp.
+    # -99.0 is a sentinel for "nothing measured" and means one of: no audio
+    # stream, `with_audio_peak=False`, the peak timed out, volumedetect
+    # printed no level, or the probe itself failed (the error rows).
+    audio_peak_db: float
     size_bytes: int
     error: str = ""
 
@@ -169,7 +174,7 @@ def audio_peak(path: Path, timeout: int = 180) -> float:
     Returns -99.0 when there is no audio or detection fails.
     """
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
+        ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-i", str(path),
          "-af", "volumedetect", "-vn", "-sn", "-dn", "-f", "null", "-"],
         capture_output=True, text=True, timeout=timeout, check=False,
     )

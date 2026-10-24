@@ -1,9 +1,191 @@
 [build-system]
-requires = ["setuptools>=68"]
+# 77 is the first setuptools that reads `license = "MIT"` below, a PEP 639
+# SPDX string. Every release tried from 68.2.2 to 76.1.0 rejects it with
+# "project.license must be valid exactly by one definition", which names
+# neither a version nor a fix. A plain `pip install` builds in an isolated
+# env and fetches a new enough setuptools itself. Only a build that takes
+# the ENVIRONMENT's setuptools sees the failure: `--no-build-isolation`, a
+# distro or Nix setuptools, a constraints file that pins setuptools. With
+# this floor pip names setuptools in the conflict (isolated build with a
+# pin) or with `--check-build-dependencies`; plain `--no-build-isolation`
+# does not check build requirements, so it still reaches the old message.
+# The table form `license = {text = "MIT"}` builds everywhere but
+# setuptools has scheduled its removal for 2027-02-18.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vmcore"
+# 0.4.0 rather than 0.3.1, by the policy below. The release adds capability
+# that changes nothing existing: `__version__`, the keyword-only arguments
+# `proxy_ffmpeg`, `strict`, `check_exit` and `stall_timeout`, and the
+# exceptions `UnsizableInput` and `DecodeTimeout`. That is a minor bump on
+# its own. It also changes things that move something observable and no
+# output bytes. They are listed under "Flagged default changes in 0.4.0".
+#
+# Which commits a consumer may pin. Pin the SHA of the squash commit that
+# carries 0.4.0, and no commit of the unsquashed series. The series behind
+# 0.4.0 is merged as ONE squash commit, so one SHA exists to pin. Some
+# commits inside the series say 0.3.0. The first one that says 0.4.0 holds a
+# tree that later commits change. 0.3.0 shows the cost of a number that
+# names several commits: ee0767a, d250867 and 757f484 all said 0.3.0.
+#
+# The opt-ins `strict`, `check_exit` and `stall_timeout` become defaults at
+# the next breaking release, and only with the consumers' agreement. Until
+# then each is off, so no existing call changes.
+#
+# Flagged default changes in 0.4.0. Everything else is unchanged in values,
+# bytes, exceptions and leftover files, which a differential run of the
+# default call patterns against 757f484 shows. Numbers below were measured
+# on ext4 with ffmpeg 6.1.1. The permission cases were measured as uid 0 with
+# the DAC capabilities dropped. A statement marked inferred was not run.
+#
+# 1. Every ffmpeg argv gains `-nostdin` at index 2, straight after
+#    `-hide_banner`. That covers `decode_cmd`, the `sample_frames` process,
+#    `audio_peak`, `thumbs.extract`, `build_proxy` and the `testing` builders.
+#    It shows in `DecodeError.cmd`, `TimeoutExpired.cmd`, `str` of a
+#    `TimeoutExpired`, and any code that logs or hashes an argv. A cache keyed
+#    on argv text misses once. ffprobe is unchanged. The `segcache` key here
+#    does not contain the argv. The reason is that ffmpeg reads stdin for
+#    keystrokes. A job in a background process group whose stdin is still
+#    the terminal is stopped by SIGTTOU. GNU nohup redirects a terminal stdin
+#    and avoids the stop, which was measured with coreutils 9.4. The macOS
+#    nohup case rests on rule 17 of the birthday pipeline and was not
+#    measured here.
+# 2. `build_proxy` writes to a hidden partial beside `out` and renames it
+#    onto `out` when ffmpeg exited 0 and wrote something. The name is
+#    `.<12 hex>.<pid>.<thread>.part<ext>`. The hex is part of the SHA-1 of
+#    `out.name`, so the name does not depend on the stem. `<ext>` is the text
+#    from the last dot of `out.name`, so `out=x.mp4` gives a name ending
+#    `.part.mp4`. The partial shows in the argv and in `TimeoutExpired.cmd`.
+#    `build_proxy` creates it, empty, and locks it, as item 4 says, before
+#    ffmpeg starts. For that moment a zero-byte hidden file exists. A test
+#    double that asserts the partial does not exist yet will fail.
+# 3. `build_proxy` after a timeout or an interrupt. `out` is exactly as it
+#    was and the partial is gone. On 757f484 `out` held a partial file that
+#    ffprobe rejects, and it replaced a good proxy. The size of that file
+#    differs from run to run.
+# 4. `build_proxy` after a hard kill of the caller, such as SIGKILL, an OOM
+#    kill or a container stop. The partial stays and `out` does not exist.
+#    757f484 left `out` unplayable, or playable when an orphaned ffmpeg
+#    finished into it. A consumer that skips clips whose `out` exists will
+#    rebuild this one. A builder holds an `flock` on its partial from before
+#    ffmpeg starts until it returns. The kernel drops the lock when the
+#    process ends by any means. Before each build, `build_proxy` removes
+#    earlier partials of the same `out` that it can lock. Each must sit in
+#    the same directory, carry the same hash and extension, and be a regular
+#    file, not a symlink. The pid in the name is never read. A container
+#    that restarts with the same pid sweeps its own leftover. A build in
+#    another container that shares the directory is never swept while it
+#    runs. Both were measured with `unshare --pid`. The sweep is off where
+#    `fcntl` is missing, which is Windows. On a filesystem that refuses
+#    `flock` the sweep's lock attempt raises, and the file is kept. Its
+#    failures are swallowed. It never touches the short fallback name of
+#    item 7 or any other file. A hard kill in the short-name band leaves its
+#    partial. The lock needs both sides to see the same inode, so keep the
+#    proxy directory on a local disk.
+# 5. `build_proxy` flushes the finished partial with `fsync` before the
+#    rename, and 757f484 did not flush. The cost is the time to write back
+#    what the kernel still holds. It grows with the size of the proxy and
+#    depends on the device. On one VM disk it was linear in size. For a proxy
+#    of a few megabytes it was lost in the noise of the encode. The flush adds
+#    an `OSError` path after a finished encode. The call then raises, `out`
+#    is as it was and the partial is gone. The flush stays because it is what
+#    makes the rename durable.
+# 6. A test double for `subprocess.run` must write the last element of the
+#    argv, which is the partial. A double that exits 0 and writes nothing, or
+#    writes straight to `out`, gets False from `build_proxy` and loses `out`.
+#    757f484 returned True and kept it. Make the double create the file that
+#    the last argument names.
+# 7. Output names. The hidden name has to fit NAME_MAX and PATH_MAX, and
+#    757f484 wrote any `out` that fit. Three cases keep that.
+#    - An `out` named only an extension, such as `.mp4`, builds as at 757f484.
+#      `Path.suffix` is empty for it, and ffmpeg reads the text after the
+#      last dot.
+#    - A path within about 45 bytes of PATH_MAX builds. The hidden name drops
+#      the hash and becomes `.<pid>.<thread>.part<ext>`. It has no token, so
+#      the sweep never removes it. It carries the thread, so two builds that
+#      run at once never share it, whether they build one `out` or two.
+#    - A path within about 30 bytes of it, where even that does not fit, is
+#      built in place, as at 757f484. A timeout then leaves a partial file
+#      at `out`. A path of PATH_MAX bytes or more fails as it did, with
+#      ENAMETOOLONG from `out.unlink`. PATH_MAX is 4096 on Linux, where 4095
+#      bytes opened and 4096 did not. macOS is documented to use 1024 and
+#      was not measured.
+#    Three cases change. The first is a relative `out` with no directory
+#    part. Its name may read to ffmpeg as an option or a protocol, as
+#    `a:b.mp4`, `-proxy.mp4` and `file:x.mp4` do. 757f484 returned False for
+#    them, and the last also wrote a stray `x.mp4`. Now they return True and
+#    the file has the name given. The second is `out=Path('.')`. It raises
+#    `ValueError`, because it has an empty name. It raised
+#    `IsADirectoryError` after the encode at 757f484. The third is an `out`
+#    that is a directory. It raises `IsADirectoryError` before any work,
+#    where 757f484 ran the encode and raised it from the unlink.
+# 8. `DecodeError` now pickles and copies. At 757f484 `pickle`, `copy.copy`
+#    and `copy.deepcopy` raised `TypeError`, and a `ProcessPoolExecutor`
+#    that got one back reported `BrokenProcessPool`. Now the future raises
+#    `DecodeError`. A handler that caught `BrokenProcessPool` for this case
+#    no longer runs. Whether any consumer has one is unknown.
+# 9. `store.atomic_write_text` writes through `<name>.<pid>.<thread>.tmp`
+#    where it wrote `<name>.tmp`. A crash leaves that name. With a 5-digit
+#    pid and a 15-digit thread id, the longest writable file name falls from
+#    251 to 229 bytes. With `backup=True` it falls to 225. Each extra pid or
+#    thread digit costs one more byte. The `.bak` lands through its own temp.
+#    The `.bak` edge cases are listed below.
+# 10. The `testing` validators. `v1_shape_problems` lists a missing or
+#    non-integer `<start>` where it raised `TypeError` or `ValueError`. The
+#    asserting helpers raise `AssertionError` explicitly, so `python -O` no
+#    longer switches them off. `parse_xml` raises `AssertionError` for a file
+#    of fewer than two lines where it raised `IndexError`.
+# 11. The version. `vmcore.__version__` is new and equals `version` here,
+#    which a test pins. The package version moves from 0.3.0 to 0.4.0.
+# 12. The build requirement is `setuptools>=77`, where 757f484 asked for 68.
+#    The `license = "MIT"` string needs 77, and 757f484 failed on 68 to 76
+#    with a message that names neither. A build that takes the environment's
+#    setuptools, such as `--no-build-isolation`, is affected either way.
+#
+# Second-order effects of the rename in item 2 and the temp name in item 9.
+# Each was measured against 757f484.
+#
+# - A rebuild over an existing proxy needs room for the old and the new file
+#   at once. On a volume with less free space than the new proxy, 757f484
+#   returned True. 0.4.0 returns False and removes the previous proxy.
+# - A watcher on the proxy directory sees different events. At 757f484 `out`
+#   got `CREATE` and `CLOSE_WRITE`. Now the hidden name gets `CREATE` and
+#   `CLOSE_WRITE`, then `MOVED_FROM`, and `out` gets `MOVED_TO`. A watcher
+#   that reacts to `CLOSE_WRITE` on any name sees the hidden file finish
+#   before the rename. This was measured with inotify on Linux.
+# - While a build runs, `Path.glob`, `Path.iterdir` and `os.listdir` list the
+#   hidden partial. `glob.glob` and `probe.find_clips` do not. At 757f484 all
+#   five listed the half-written `out`.
+# - A symlink at `out` is replaced by a regular file. 757f484 wrote through
+#   it and updated the target.
+# - A hard link at `out` is severed. The other name keeps the old content.
+# - The mode of an existing `out` is reset to the umask default. A 0600, 0640
+#   or 0666 file becomes 0644 under umask 022.
+# - An existing 0400 `out` is replaced and `build_proxy` returns True.
+#   757f484 returned False and removed it.
+# - A read-only directory that holds a writable `out` makes `build_proxy`
+#   raise `PermissionError`. 757f484 returned True.
+# - Replacing `out` needs delete permission on it. In a sticky directory,
+#   mode 1777, that holds another user's world-writable `out`, 757f484 wrote
+#   through the file and returned True. Now the encode runs and the rename
+#   raises `PermissionError`. A replaced `out` is owned by the caller.
+# - A name that no filesystem can hold, 256 bytes on ext4, still raises
+#   `OSError` with errno ENAMETOOLONG. It now does so after the encode, not
+#   after a fast ffmpeg failure.
+# - With `backup=True`, a `.bak` that is a directory raises
+#   `IsADirectoryError`. 757f484 copied the file into it.
+# - With `backup=True`, a read-only `.bak` is replaced. 757f484 raised
+#   `PermissionError` and wrote nothing.
+# - With `backup=True`, a `.bak` that is a symlink is replaced. 757f484
+#   wrote through it.
+# - With `full_rate_vf` set, `sample_frames` reads `proc.returncode` after
+#   frames were yielded. 757f484 read it only when nothing was yielded. A
+#   hand-written fake `Popen` with no `returncode` attribute then raises
+#   `AttributeError`. A real `Popen` always has the attribute. This was
+#   measured with such a fake.
+#
 # 0.3.0 rather than 0.2.1: `frames.sample_frames` gained a capability, a
 # keyword-only `full_rate_vf` that rides a filter on the decode ahead of
 # the fps thinning, not a fix. Nothing existing moves - the default chain
@@ -13,7 +195,7 @@ name = "vmcore"
 # hit and a TypeError naming the argument was the only acceptable way to
 # learn that a key was wrong.) Consumers pin a commit, so nothing moves
 # until someone bumps a pin deliberately.
-version = "0.3.0"
+version = "0.4.0"
 description = "Input-agnostic video plumbing: probe, sampled frames, frame signals, HDR-aware proxies, FCP7/xmeml, and a content-addressed segment cache"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,3 +215,6 @@ packages = ["vmcore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: waits on a clock on purpose, such as a stall limit, a timeout or a real-time decode. `make test` skips these and `make test-all` runs them.",
+]

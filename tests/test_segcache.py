@@ -2,6 +2,8 @@
 # these test the key derivation and the cache directory contract directly.
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 from pathlib import Path
@@ -263,3 +265,52 @@ def test_two_threads_storing_one_key_do_not_collide(tmp_path):
     assert cache.get("one-key").read_bytes() == rendered.read_bytes()
     # and nothing stray: one entry, no abandoned temp files
     assert [p.name for p in (tmp_path / "cache").iterdir()] == ["one-key.mp4"]
+
+
+# ---------------------------------------------------------------------------
+# The key's contents, written out. The module docstring lists them and says
+# changing one re-keys every consumer's cache; these tests are what make
+# that list true. They rebuild the payload by hand rather than calling the
+# code under test, so a new field, a renamed one, a different rounding or a
+# different hash fails here before it reaches a cache.
+# ---------------------------------------------------------------------------
+
+def _digest(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def test_profile_hash_is_the_hash_of_exactly_w_h_mode_and_video():
+    expected = hashlib.sha256(json.dumps(
+        {"w": 1920, "h": 1080, "mode": "fit", "video": FIT["video"]},
+        sort_keys=True).encode()).hexdigest()[:16]
+    assert profile_hash(FIT) == expected
+
+
+def test_the_key_is_the_hash_of_exactly_these_fields(tmp_path):
+    src = _src(tmp_path)
+    st = os.stat(src)
+    base = {"src": str(src.resolve()), "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns, "in": "1.500000", "fps": "24.000000",
+            "frames": 36, "speed": 0.0, "hdr": False,
+            "profile": profile_hash(FIT)}
+    assert segment_key(src, 1.5, 36, None, False, FIT, fps=24) == _digest(base)
+    # a crop adds the centre, rounded to the filter expression's precision
+    crop = {**base, "speed": 2.0, "hdr": True,
+            "profile": profile_hash(SMARTCROP), "cx": 0.3333, "cy": 0.5}
+    assert segment_key(src, 1.5, 36, 2, True, SMARTCROP, fps=24,
+                       cx=1 / 3, cy=0.5) == _digest(crop)
+
+
+def test_nothing_about_the_renderer_or_the_environment_is_in_the_key(
+        tmp_path, monkeypatch):
+    """The docstring says the key cannot see the ffmpeg binary or a constant
+    spliced into the graph. Pin the half of that a test can reach: no
+    environment variable, PATH entry or module constant moves it."""
+    src = _src(tmp_path)
+    args = (src, 1.5, 36, None, True, FIT)
+    before = segment_key(*args, fps=24)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    import vmcore.proxy as proxy
+    monkeypatch.setattr(proxy, "TONEMAP", "zscale=transfer=linear,tonemap=mobius")
+    assert segment_key(*args, fps=24) == before

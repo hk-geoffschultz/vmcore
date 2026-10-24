@@ -85,7 +85,7 @@ def test_scaled_dims_matches_ffmpeg_byte_count(w, h):
 
     nw, nh = probe.scaled_dims(w, h, 960)
     proc = subprocess.run(
-        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+        ["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
          f"color=c=red:size={w}x{h}:rate=1:d=1", "-frames:v", "1",
          "-vf", "scale='if(gt(iw,ih),960,-2)':'if(gt(iw,ih),-2,960)'",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],

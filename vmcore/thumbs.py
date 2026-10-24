@@ -1,8 +1,17 @@
 """Evenly spaced JPEG thumbnails from a clip, for human review.
 
 One ffmpeg call per clip, using the same `fps` + `scale` chain that
-`vmcore.frames` pipes raw — so a thumbnail shows what the analysis saw,
-at a size a person can actually look at.
+`vmcore.frames` pipes raw, so a thumbnail has the framing and the scale
+the analysis worked at, in a size a person can actually look at.
+
+It does not have the analysis's colour for BT.709 or BT.2020 sources. The
+frames path converts YUV to BGR with the clip's tagged matrix. This path
+hands YUV straight to the mjpeg encoder, which writes no matrix, so every
+JPEG decoder reads it as BT.601. Measured 2026-10-22 on a BT.709-tagged
+clip of eight known colour patches (ffmpeg 6.1.1): the analysis frame is
+within 3 code values of the source colour (mean 1.1) and the decoded
+thumbnail within 19 (mean 6.0). Fine for judging framing; do not judge
+colour or measure it from these files.
 
 Deliberately not the origin's `contact.py` approach. That one opens each
 clip with `cv2.VideoCapture`, seeks by frame index, and composites a sheet
@@ -49,7 +58,7 @@ def extract(path: Path, out_dir: Path, key: str, duration: float,
     pattern = str(out_dir / f"{key}.%02d.jpg")
 
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
+        ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
          "-i", str(path), "-vf", vf, "-frames:v", str(count),
          "-q:v", "4", "-y", pattern],
         capture_output=True, timeout=timeout, check=False,

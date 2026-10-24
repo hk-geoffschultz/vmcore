@@ -1,7 +1,9 @@
 """Where the pipeline keeps its state between stages.
 
 Everything lives in a single work directory so a run is resumable and
-inspectable. Nothing here is precious — delete the folder and re-run.
+inspectable. Whether the folder is disposable is the consumer's call: a
+consumer that keeps hand corrections in it (the birthday pipeline keeps
+work/overrides.csv there) cannot delete it and re-run.
 
 This is trimmed down from the birthday pipeline's Store: that one grew
 path properties for a specific stage graph (clips.csv, frames.json,
@@ -20,8 +22,29 @@ import io
 import json
 import os
 import shutil
+import threading
 from pathlib import Path
 from typing import Iterator
+
+
+def _temp_sibling(path: Path) -> Path:
+    """`<name>.<pid>.<thread>.tmp`, next to `path`.
+
+    The name used to be `<name>.tmp`, derived from the target alone, which
+    two writers of one file share. They then write into one inode: the first
+    to `os.replace` publishes whatever bytes are in it so far, and the second
+    finds no temp of its own and raises FileNotFoundError. Measured at
+    757f484, 8 threads x 150 writes of one file, five runs: 654 to 692 of
+    1200 writes raised, and 89 to 272 of 462 to 800 concurrent reads saw
+    unparseable JSON. A fixed interleave of two writers left
+    `{"status": "x"}ivered", ...` in place of the file. With the name
+    qualified: 0 of 1200 writes and 0 of 572 to 907 reads in all five runs.
+    The process and thread in the name make it one writer's own
+    (the rule `segcache.SegmentCache.put` adopted for the same reason),
+    and the `.tmp` suffix is kept so a `*.tmp` glob still finds it.
+    """
+    return path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
 
 
 def atomic_write_text(path: Path, text: str, backup: bool = False,
@@ -30,14 +53,39 @@ def atomic_write_text(path: Path, text: str, backup: bool = False,
 
     Write a sibling temp file, flush + fsync, then os.replace, which is
     atomic on POSIX. With `backup=True` the previous version is kept as
-    `<name>.bak` first. Every stage file another process reads should go
-    through here, not a bare `Path.write_text`.
+    `<name>.bak` first, copied to a temp name and renamed into place so a
+    reader of the backup never sees it half written. Every stage file
+    another process reads should go through here, not a bare
+    `Path.write_text`.
+
+    The temp name is `<name>.<pid>.<thread>.tmp` (see `_temp_sibling`), so
+    concurrent writers of one file each get their own. The last
+    `os.replace` wins whole; the file is never a mixture. A crash between
+    the write and the rename leaves that one temp file behind. The old fixed
+    name was overwritten by the next write. The temp name adds a dot,
+    the pid, a dot, the thread id and `.tmp`. With a 5-digit pid and a
+    15-digit thread id that is 26 bytes of file name. The longest target that
+    can be written on ext4 then falls from 251 to 229, or to 225 with
+    `backup=True`. Each digit more in the pid or the thread id costs one more
+    byte, and each digit fewer gives one back. With a 4-digit pid and a
+    15-digit thread id the measured limits were 230 and 226.
+
+    The temp is created with `open()`, so the file's mode is the process
+    umask applied to 0o666, exactly as before. `tempfile.mkstemp` would
+    create it 0o600, and `os.replace` would carry that onto `path`. An
+    existing `path` keeps no mode of its own: the replacement is a new file.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if backup and path.exists():
-        shutil.copy2(path, path.with_name(path.name + ".bak"))
-    tmp = path.with_name(path.name + ".tmp")
+        bak = path.with_name(path.name + ".bak")
+        bak_tmp = _temp_sibling(bak)
+        try:
+            shutil.copy2(path, bak_tmp)
+            os.replace(bak_tmp, bak)
+        finally:
+            bak_tmp.unlink(missing_ok=True)
+    tmp = _temp_sibling(path)
     try:
         with open(tmp, "w", encoding=encoding, newline="") as fh:
             fh.write(text)
@@ -45,10 +93,7 @@ def atomic_write_text(path: Path, text: str, backup: bool = False,
             os.fsync(fh.fileno())
         os.replace(tmp, path)
     finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+        tmp.unlink(missing_ok=True)
 
 
 def atomic_write_json(path: Path, obj, indent: int = 2,

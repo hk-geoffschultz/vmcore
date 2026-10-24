@@ -8,11 +8,23 @@ measured against real footage (see CLAUDE.md).
 
 Ported in spirit from the birthday pipeline's `describe.py` and
 `frame_sharpness`, but on numpy alone. The originals use OpenCV for
-resizing, BGR→HSV and the Laplacian; we get resizing free from
-`vmcore.frames` (ffmpeg has already scaled to `long_edge` by the time a
-frame arrives), and the other two are a few lines each. That trades a
-~60MB wheel for about thirty lines, and keeps the dependency list short
-enough to stay honest.
+resizing, BGR→HSV and the Laplacian. Nothing here resizes, because
+`vmcore.frames` has ffmpeg scale to `long_edge` before a frame arrives, and
+the other two are a few lines each. That trades a ~60MB wheel for about
+thirty lines, and keeps the dependency list short enough to stay honest.
+
+The resize is not free, though: it is part of every measurement. Laplacian
+variance depends on the scale it is taken at, and not monotonically. One
+1920x1080 source measured 0.0116, 0.0041, 0.0047 and 0.0098 at long edges
+1920, 960, 480 and 240 (ffmpeg 6.1.1, 2026-10-22). Compare values only
+between clips measured at the same `long_edge`.
+
+Nor are these values comparable with another pipeline's. Luma is scaled to
+0..1 here, so `sharpness` lies in 0..16 (a one-pixel checkerboard scores
+exactly 16.0); the same stencil on 0..255 luma scores 65025 times as much.
+A floor, weight or percentile tuned on another pipeline's sharpness does
+not carry over, and neither do its stored values. The birthday pipeline's
+floor of 1600 is above anything this module can return.
 
 Frames arrive as HxWx3 uint8 in **BGR** order, the way ffmpeg's rawvideo
 pipe emits them.
@@ -114,7 +126,8 @@ def sharpness(frame: np.ndarray) -> float:
     energy and score low. The absolute number is scene-dependent (a busy
     build scores higher than a blank wall at equal focus), so it is only
     ever meaningful for ranking clips against each other, never against a
-    fixed threshold.
+    fixed threshold, and only between clips measured at the same long edge
+    (see the module docstring).
 
     The 5-point stencil, written out rather than convolved: interior
     pixels only, so no edge-padding convention has to be invented.

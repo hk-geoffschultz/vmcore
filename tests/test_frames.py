@@ -194,10 +194,12 @@ def test_analysis_only_command_carries_the_chain_in_vf(tmp_path):
     assert cmd[0] == "ffmpeg"
     assert cmd[cmd.index("-vf") + 1] == vf
     assert "-filter_complex" not in cmd
-    # Without the fragment the argv is exactly the old one.
+    # Without the fragment the argv is exactly the one from before the
+    # argument existed, plus the -nostdin every vmcore ffmpeg carries (see
+    # tests/test_nostdin.py for why and for the guard that keeps it so).
     plain = decode_cmd(tmp_path / "c.mp4", analysis_vf(2.0, LONG_EDGE))
     assert plain == [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-i", str(tmp_path / "c.mp4"),
         "-vf", analysis_vf(2.0, LONG_EDGE),
         "-map", "0:v:0",

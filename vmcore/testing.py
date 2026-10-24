@@ -34,7 +34,7 @@ def _encode(base: list[str], path: Path) -> None:
 
 def make_mp4(path: Path, duration: float, w: int = 64, h: int = 36) -> None:
     src = f"smptebars=size={w}x{h}:rate={FPS}:duration={duration:.3f}"
-    _encode(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+    _encode(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
              "-f", "lavfi", "-i", src, "-pix_fmt", "yuv420p"], path)
 
 
@@ -50,7 +50,7 @@ def make_cut_mp4(path: Path, before: float = 1.0, after: float = 1.0,
     """
     black = f"color=c=black:s={w}x{h}:r={FPS}:d={before:.3f}"
     white = f"color=c=white:s={w}x{h}:r={FPS}:d={after:.3f}"
-    _encode(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+    _encode(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
              "-f", "lavfi", "-i", black, "-f", "lavfi", "-i", white,
              "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
              "-map", "[v]", "-pix_fmt", "yuv420p"], path)
@@ -58,8 +58,8 @@ def make_cut_mp4(path: Path, before: float = 1.0, after: float = 1.0,
 
 
 def make_wav(path: Path, duration: float) -> None:
-    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                    "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono",
+    subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
+                    "-y", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono",
                     "-t", f"{duration:.3f}", "-c:a", "pcm_s16le", str(path)],
                    check=True, capture_output=True)
 
@@ -238,16 +238,32 @@ def v1_shape_problems(root) -> list[str]:
             except (TypeError, ValueError):
                 problems.append(f"{cid}: non-integer timing")
         for track in seq.findall("media/video/track"):
-            starts = [int(ci.findtext("start"))
-                      for ci in track.findall("clipitem")]
+            starts = []
+            for ci in track.findall("clipitem"):
+                try:
+                    starts.append(int(ci.findtext("start")))
+                except (TypeError, ValueError):
+                    # This used to raise, which threw away every problem
+                    # collected above. A MISSING <start> is already reported
+                    # by the tag check; a non-integer one only on the path
+                    # that reaches the arithmetic (a stub <file> skips it).
+                    cid = ci.get("id", "?")
+                    if (ci.find("start") is not None
+                            and f"{cid}: non-integer timing" not in problems):
+                        problems.append(f"{cid}: non-integer timing")
             if starts != sorted(starts):
                 problems.append("clipitems not chronological on a track")
     return problems
 
 
 def assert_v1_shape(root) -> None:
+    """Raise AssertionError listing every problem. An explicit raise, not an
+    `assert`: this module ships in the package, `python -O` strips assert
+    statements, and a validator that turns itself off under -O reports a
+    broken file as fine."""
     problems = v1_shape_problems(root)
-    assert not problems, "\n".join(problems)
+    if problems:
+        raise AssertionError("\n".join(problems))
 
 
 def audio_clipitems(seq):
@@ -301,13 +317,25 @@ def audio_shape_problems(root) -> list[str]:
 
 
 def assert_audio_shape(root) -> None:
+    """As `assert_v1_shape`, for the audio contract."""
     problems = audio_shape_problems(root)
-    assert not problems, "\n".join(problems)
+    if problems:
+        raise AssertionError("\n".join(problems))
 
 
 def parse_xml(path: Path):
+    """The root element of an xmeml file, after checking the two-line header
+    the importer needs. Raises AssertionError (never an assert statement, and
+    never IndexError for a file shorter than two lines) naming the line that
+    is wrong."""
     text = Path(path).read_text(encoding="utf-8")
     lines = text.splitlines()
-    assert lines[0].startswith('<?xml version="1.0"'), lines[0]
-    assert lines[1] == "<!DOCTYPE xmeml>", lines[1]
+    if not lines:
+        raise AssertionError("empty file")
+    if not lines[0].startswith('<?xml version="1.0"'):
+        raise AssertionError(lines[0])
+    if len(lines) < 2:
+        raise AssertionError("no second line: expected <!DOCTYPE xmeml>")
+    if lines[1] != "<!DOCTYPE xmeml>":
+        raise AssertionError(lines[1])
     return ET.fromstring(text)

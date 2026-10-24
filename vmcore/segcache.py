@@ -16,12 +16,31 @@ function's shape would have caught that. `fps` is now a required argument
 (see `segment_key`) - but the class of problem is not fixed by fixing one
 instance of it.
 
+What the key holds, exactly (`segment_key`, pinned field by field by
+tests/test_segcache.py): the source's resolved absolute path, size and
+mtime_ns; the in-point at 6 decimals; the frame rate at 6 decimals; the
+frame count; the speed; the HDR flag; `profile_hash(profile)`; and, for a
+crop, the centre at 4 decimals. `profile_hash` reads four profile fields,
+`w`, `h`, `mode` and `video`, and ignores the rest on purpose (`audio`,
+a name, a card aspect). The path is part of it, so a moved or renamed
+source misses once, and a key is not portable between machines. Changing
+any member re-keys every consumer's cache: a one-time cold re-render, as
+adding `fps` was in 0.2.0. Do not change the key to repair a gap listed
+below, and do not hide the missing input in `mode`; key on the argv instead
+(described below).
+
 What an enumeration cannot reach, by construction:
 
-- Module constants spliced into the filter graph. A tonemap chain, a
-  `setparams` VUI workaround, colour tags, `-pix_fmt`: retune any of them
-  and every affected segment renders different pixels under an unchanged
-  key. `hdr` says WHICH branch was taken, never what that branch contains.
+- Module constants spliced into the filter graph. A tonemap chain (this
+  package's `proxy.TONEMAP` is one; a consumer's segment renderer has its
+  own), a `setparams` VUI workaround, colour tags, `-pix_fmt`: retune any
+  of them and every affected segment renders different pixels under an
+  unchanged key. `hdr` says WHICH branch was taken, never what that branch
+  contains.
+- The ffmpeg that renders. One argv does not mean one output across
+  builds: the birthday pipeline recorded a static build that silently
+  dropped `-color_primaries` and `-color_trc`, so the same command wrote
+  different tags. The key carries no binary path, version or build string.
 - Anything with no source to stat. A gap slate's pixels are entirely
   described by a colour, a size, a rate and a duration; `segment_key`
   stats the source first, so it cannot key one at all.
