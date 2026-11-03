@@ -195,7 +195,15 @@ name = "vmcore"
 # hit and a TypeError naming the argument was the only acceptable way to
 # learn that a key was wrong.) Consumers pin a commit, so nothing moves
 # until someone bumps a pin deliberately.
-version = "0.4.0"
+#
+# 0.5.0 rather than 0.4.1: `probe.probe_location` and four trailing,
+# defaulted `ClipInfo` fields (`lat`, `lon`, `loc_source`, `created_local`)
+# are new capability read from the existing ffprobe call. Every existing
+# field and every ffmpeg/ffprobe argv is unchanged. One fix moves a value:
+# `scaled_dims` uses `w > h`, as gt(iw,ih) does, so a SQUARE source at an
+# ODD long edge is (L+1)xL, what ffmpeg emits, where 0.4.0 said Lx(L+1).
+# Every non-square answer and every even long edge is unchanged.
+version = "0.5.0"
 description = "Input-agnostic video plumbing: probe, sampled frames, frame signals, HDR-aware proxies, FCP7/xmeml, and a content-addressed segment cache"
 readme = "README.md"
 requires-python = ">=3.11"
