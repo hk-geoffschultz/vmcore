@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, asdict
@@ -42,6 +43,17 @@ class ClipInfo:
     audio_peak_db: float
     size_bytes: int
     error: str = ""
+    # Added in 0.5.0, after every existing field and all defaulted, so a
+    # positional construction keeps working and `as_row()` only grows four
+    # keys at its end. Where the clip was shot, from an ISO 6709 tag
+    # (`_location`): degrees, None when the file carries no parseable one.
+    lat: float | None = None
+    lon: float | None = None
+    loc_source: str = ""      # "iso6709", or "" when lat/lon are None
+    # The Apple local creation date, verbatim with its offset
+    # (`2026-07-14T09:12:31-0700`), or "". `created` stays the UTC
+    # `creation_time` for an iPhone clip; this is the one that knows the day.
+    created_local: str = ""
 
     def as_row(self) -> dict:
         return asdict(self)
@@ -145,11 +157,15 @@ def scaled_dims(w: int, h: int, long_edge: int) -> tuple[int, int]:
     arithmetic) disagreed whenever the true value was odd or sat next to
     an odd integer - 2560x1080 -> 406 not 404, 1920x1078 -> 540 not 538 -
     and the pipe was then read misaligned. Verified against ffmpeg on
-    lavfi sources of those sizes. Floor at 2.
+    lavfi sources of those sizes, and for a square source at an odd and an
+    even long edge. Floor at 2.
     """
     if w <= 0 or h <= 0:
         raise ValueError(f"non-positive dimensions {w}x{h}")
-    if w >= h:
+    # Strictly greater, as gt() is: a square source takes the -2 width, so
+    # at an odd L ffmpeg emits (L+1)xL. `>=` said Lx(L+1), the same byte
+    # count, which a raw-pipe reader would read as sheared frames, exit 0.
+    if w > h:
         nw = long_edge
         nh = 2 * ((h * long_edge + w) // (2 * w))
     else:
@@ -164,6 +180,78 @@ def _creation_time(fmt: dict, stream: dict) -> str:
             if tags.get(key):
                 return str(tags[key])
     return ""
+
+
+def _creation_local(fmt: dict, stream: dict) -> str:
+    """`com.apple.quicktime.creationdate` verbatim, offset included: format
+    tags, then stream tags, "" when neither has it. One key on purpose:
+    `creation_time` is UTC and `date` may be a bare year, so neither can
+    give the local day."""
+    for tags in (fmt.get("tags", {}) or {}, stream.get("tags", {}) or {}):
+        if tags.get("com.apple.quicktime.creationdate"):
+            return str(tags["com.apple.quicktime.creationdate"])
+    return ""
+
+
+_LOCATION_KEYS = ("com.apple.quicktime.location.ISO6709", "location",
+                  "location-eng")
+# ISO 6709 decimal degrees: latitude, longitude, an optional altitude
+# (ignored), an optional trailing solidus. `+37.7749-122.4194+010.000/`.
+_ISO6709 = re.compile(
+    r"^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)(?:[+-]\d+(?:\.\d+)?)?/?$")
+
+
+def _location(fmt: dict, stream: dict) -> tuple[float | None, float | None, str]:
+    """`(lat, lon, "iso6709")` from the first non-empty location tag, format
+    tags then stream tags, keys in `_LOCATION_KEYS` order. A value that does
+    not parse, or names a latitude beyond 90 or a longitude beyond 180 (the
+    degrees-minutes form `+3746.49-12225.16` matches the regex too), gives
+    `(None, None, "")`. A bad first value does not fall through to a later
+    key, so a damaged tag reads as no location rather than being masked by
+    another. Never raises."""
+    value = ""
+    for tags in (fmt.get("tags", {}) or {}, stream.get("tags", {}) or {}):
+        for key in _LOCATION_KEYS:
+            if tags.get(key):
+                value = str(tags[key])
+                break
+        if value:
+            break
+    m = _ISO6709.match(value)
+    if not m:
+        return None, None, ""
+    lat, lon = float(m.group(1)), float(m.group(2))
+    if abs(lat) > 90 or abs(lon) > 180:
+        return None, None, ""
+    return lat, lon, "iso6709"
+
+
+def _probe_cmd(path: Path) -> list[str]:
+    return ["ffprobe", "-v", "error", "-print_format", "json",
+            "-show_format", "-show_streams", str(path)]
+
+
+def probe_location(path: Path) -> tuple[float | None, float | None, str, str]:
+    """`(lat, lon, loc_source, created_local)` for one file: the same
+    ffprobe call `probe_clip` makes, without the audio peak and without
+    building a `ClipInfo`, for locating records already analysed.
+
+    Reads the format tags and the first video stream's tags, as
+    `probe_clip` does; a file with no video stream is read from its format
+    tags alone. A timeout, an empty or unreadable probe gives
+    `(None, None, "", "")`. Raises `FileNotFoundError` with no ffprobe.
+    """
+    try:
+        data = json.loads(_run(_probe_cmd(path)))
+    except (subprocess.TimeoutExpired, ValueError):
+        return None, None, "", ""
+    if not isinstance(data, dict):
+        return None, None, "", ""
+    fmt = data.get("format", {}) or {}
+    streams = data.get("streams", []) or []
+    v = next((s for s in streams if s.get("codec_type") == "video"), {})
+    lat, lon, source = _location(fmt, v)
+    return lat, lon, source, _creation_local(fmt, v)
 
 
 def audio_peak(path: Path, timeout: int = 180) -> float:
@@ -189,10 +277,7 @@ def audio_peak(path: Path, timeout: int = 180) -> float:
 
 def probe_clip(path: Path, with_audio_peak: bool = True) -> ClipInfo:
     try:
-        raw = _run([
-            "ffprobe", "-v", "error", "-print_format", "json",
-            "-show_format", "-show_streams", str(path),
-        ])
+        raw = _run(_probe_cmd(path))
     except subprocess.TimeoutExpired:
         # A dead volume or a corrupt container can wedge ffprobe; that is
         # an ERROR row for this clip, not a crashed ingest.
@@ -247,6 +332,7 @@ def probe_clip(path: Path, with_audio_peak: bool = True) -> ClipInfo:
             print(f"\nWARNING: audio peak timed out for {path.name}",
                   file=sys.stderr, flush=True)
 
+    lat, lon, loc_source = _location(fmt, v)
     return ClipInfo(
         path=str(path),
         name=path.name,
@@ -258,6 +344,10 @@ def probe_clip(path: Path, with_audio_peak: bool = True) -> ClipInfo:
         created=_creation_time(fmt, v),
         audio_peak_db=peak,
         size_bytes=int(fmt.get("size", 0) or 0),
+        lat=lat,
+        lon=lon,
+        loc_source=loc_source,
+        created_local=_creation_local(fmt, v),
     )
 
 

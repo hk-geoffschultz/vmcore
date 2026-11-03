@@ -19,4 +19,4 @@ Everything keeps working right up until the package stops being liftable.
 # editable install made before a version bump all report their own version,
 # where `importlib.metadata.version("vmcore")` would report whichever
 # distribution pip happens to have recorded.
-__version__ = "0.4.0"
+__version__ = "0.5.0"
